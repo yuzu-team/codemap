@@ -30,7 +30,7 @@ import { resolve, join, dirname } from "node:path";
 import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import type { CliOptions, CodeGraph } from "./types";
-import { buildCodeGraph } from "./graph";
+import { buildCodeGraph, incrementalBuildCodeGraph } from "./graph";
 import { addSummaries } from "./summarizer";
 import { rankFiles, renderRankedResults, tokenize } from "./ranker";
 
@@ -177,15 +177,7 @@ async function loadCachedGraph(rootPath: string): Promise<CodeGraph | null> {
 
   try {
     const content = await Bun.file(cachePath).text();
-    const graph = JSON.parse(content) as CodeGraph;
-
-    // Check if cache is fresh
-    const headCommit = getHeadCommit(rootPath);
-    if (headCommit && graph.commitHash === headCommit) {
-      return graph;
-    }
-
-    return null; // stale
+    return JSON.parse(content) as CodeGraph;
   } catch {
     return null;
   }
@@ -201,13 +193,29 @@ async function ensureGraph(
   rootPath: string,
   options: { include?: string[]; exclude?: string[] } = {},
 ): Promise<CodeGraph> {
-  // Try cache first
   const cached = await loadCachedGraph(rootPath);
-  if (cached) {
-    return cached;
+
+  // If we have a cached graph with fileHashes, do an incremental rebuild
+  if (cached && cached.fileHashes && Object.keys(cached.fileHashes).length > 0) {
+    const startTime = Date.now();
+    const { graph, stats } = await incrementalBuildCodeGraph(rootPath, cached, options);
+
+    const totalDirty = stats.added + stats.changed + stats.removed;
+    if (totalDirty === 0) {
+      // Nothing changed — return cached graph as-is
+      return cached;
+    }
+
+    addSummaries(graph.modules, graph.files);
+    await saveGraph(rootPath, graph);
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.error(
+      `codemap: incremental rebuild — ${stats.added} added, ${stats.changed} changed, ${stats.removed} removed, ${stats.unchanged} unchanged (${elapsed}s)`,
+    );
+    return graph;
   }
 
-  // Build fresh
+  // No cache or legacy cache without hashes — full build
   const startTime = Date.now();
   console.error(`codemap: building graph for ${rootPath}...`);
   const graph = await buildCodeGraph(rootPath, options);
@@ -225,8 +233,26 @@ async function checkStale(rootPath: string): Promise<boolean> {
     console.log("No cached graph — stale");
     return true;
   }
-  console.log(`Graph is fresh (commit: ${cached.commitHash})`);
-  return false;
+  if (!cached.fileHashes || Object.keys(cached.fileHashes).length === 0) {
+    console.log("Legacy cache without file hashes — stale");
+    return true;
+  }
+
+  // Do an incremental diff to check if anything changed
+  const { computeFileHashes, diffFileHashes } = await import("./graph");
+  const { scan } = await import("./scanner");
+  const filePaths = await scan(rootPath);
+  const newHashes = await computeFileHashes(rootPath, filePaths);
+  const diff = diffFileHashes(cached.fileHashes, newHashes);
+  const totalDirty = diff.added.length + diff.changed.length + diff.removed.length;
+
+  if (totalDirty === 0) {
+    console.log(`Graph is fresh (${Object.keys(cached.fileHashes).length} files, commit: ${cached.commitHash})`);
+    return false;
+  }
+
+  console.log(`Graph is stale — ${diff.added.length} added, ${diff.changed.length} changed, ${diff.removed.length} removed`);
+  return true;
 }
 
 async function installHook(rootPath: string): Promise<void> {

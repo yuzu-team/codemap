@@ -188,6 +188,8 @@ export interface CodeGraph {
   edges: Edge[];
   /** Module groupings */
   modules: ModuleInfo[];
+  /** SHA-256 content hash per file path — used for incremental rebuilds */
+  fileHashes: Record<string, string>;
   /** Git commit hash at generation time */
   commitHash?: string;
   /** Generation timestamp */

@@ -3,7 +3,7 @@
  * Detects circular dependencies and computes module-level edges.
  */
 
-import { dirname } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { FileNode, Edge, ModuleInfo, CodeGraph } from "./types";
 import { buildEdges, resolveFileImports, initResolvers } from "./resolver";
 import { scan } from "./scanner";
@@ -132,53 +132,184 @@ export function computeModuleEdges(
 }
 
 /**
- * Build the complete code graph for a project.
+ * Compute SHA-256 content hash for a list of files.
+ * Returns a map of relative path → hex hash.
+ */
+export async function computeFileHashes(
+  rootPath: string,
+  relativePaths: string[],
+): Promise<Record<string, string>> {
+  const absRoot = resolve(rootPath);
+  const hashes: Record<string, string> = {};
+
+  for (const relPath of relativePaths) {
+    const file = Bun.file(join(absRoot, relPath));
+    const buffer = await file.arrayBuffer();
+    const hasher = new Bun.CryptoHasher("sha256");
+    hasher.update(buffer);
+    hashes[relPath] = hasher.digest("hex");
+  }
+
+  return hashes;
+}
+
+/**
+ * Diff file hashes to determine what changed.
+ * Returns sets of added, changed, and removed file paths.
+ */
+export function diffFileHashes(
+  oldHashes: Record<string, string>,
+  newHashes: Record<string, string>,
+): { added: string[]; changed: string[]; removed: string[] } {
+  const added: string[] = [];
+  const changed: string[] = [];
+  const removed: string[] = [];
+
+  for (const path of Object.keys(newHashes)) {
+    if (!(path in oldHashes)) {
+      added.push(path);
+    } else if (oldHashes[path] !== newHashes[path]) {
+      changed.push(path);
+    }
+  }
+
+  for (const path of Object.keys(oldHashes)) {
+    if (!(path in newHashes)) {
+      removed.push(path);
+    }
+  }
+
+  return { added, changed, removed };
+}
+
+async function initPipeline(rootPath: string): Promise<void> {
+  await initParser();
+  const tsPlugin = await registerTypescript();
+  registerPlugin(tsPlugin);
+  await initResolvers(rootPath);
+}
+
+function getCommitHash(rootPath: string): string | undefined {
+  try {
+    const proc = Bun.spawnSync(["git", "rev-parse", "--short", "HEAD"], {
+      cwd: rootPath,
+    });
+    return proc.stdout.toString().trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Build the complete code graph for a project (full rebuild).
  * This is the main orchestration function.
  */
 export async function buildCodeGraph(
   rootPath: string,
   options: { include?: string[]; exclude?: string[] } = {},
 ): Promise<CodeGraph> {
-  // 1. Initialize
-  await initParser();
-  const tsPlugin = await registerTypescript();
-  registerPlugin(tsPlugin);
-  await initResolvers(rootPath);
+  await initPipeline(rootPath);
 
-  // 2. Scan for source files
+  // Scan for source files
   const filePaths = await scan(rootPath, options);
 
-  // 3. Parse all files
+  // Hash all files
+  const fileHashes = await computeFileHashes(rootPath, filePaths);
+
+  // Parse all files
   const files = await parseFiles(rootPath, filePaths);
 
-  // 4. Resolve imports
+  // Resolve imports
   for (const file of files) {
     resolveFileImports(file, rootPath);
   }
 
-  // 5. Build dependency edges
+  // Build dependency edges
   const edges = buildEdges(files);
 
-  // 6. Group into modules
+  // Group into modules
   const modules = groupIntoModules(files);
-
-  // 7. Get git commit hash
-  let commitHash: string | undefined;
-  try {
-    const proc = Bun.spawnSync(["git", "rev-parse", "--short", "HEAD"], {
-      cwd: rootPath,
-    });
-    commitHash = proc.stdout.toString().trim() || undefined;
-  } catch {
-    // Not a git repo
-  }
 
   return {
     root: rootPath,
     files,
     edges,
     modules,
-    commitHash,
+    fileHashes,
+    commitHash: getCommitHash(rootPath),
     generatedAt: new Date().toISOString(),
   };
+}
+
+/**
+ * Incrementally rebuild a code graph by re-parsing only changed files.
+ * Keeps unchanged FileNodes from the previous graph intact.
+ */
+export async function incrementalBuildCodeGraph(
+  rootPath: string,
+  previousGraph: CodeGraph,
+  options: { include?: string[]; exclude?: string[] } = {},
+): Promise<{ graph: CodeGraph; stats: { added: number; changed: number; removed: number; unchanged: number } }> {
+  await initPipeline(rootPath);
+
+  // Scan current file list
+  const filePaths = await scan(rootPath, options);
+
+  // Hash current files
+  const newHashes = await computeFileHashes(rootPath, filePaths);
+
+  // Diff against previous hashes
+  const oldHashes = previousGraph.fileHashes ?? {};
+  const diff = diffFileHashes(oldHashes, newHashes);
+
+  // Index previous files for fast lookup
+  const prevFileMap = new Map<string, FileNode>();
+  for (const file of previousGraph.files) {
+    prevFileMap.set(file.path, file);
+  }
+
+  // Parse only added + changed files
+  const dirtyPaths = [...diff.added, ...diff.changed];
+  const freshFiles = dirtyPaths.length > 0
+    ? await parseFiles(rootPath, dirtyPaths)
+    : [];
+
+  // Build the new file list: unchanged files from previous + freshly parsed
+  const dirtySet = new Set(dirtyPaths);
+  const removedSet = new Set(diff.removed);
+  const unchangedFiles: FileNode[] = [];
+  for (const file of previousGraph.files) {
+    if (!dirtySet.has(file.path) && !removedSet.has(file.path)) {
+      unchangedFiles.push(file);
+    }
+  }
+  const allFiles = [...unchangedFiles, ...freshFiles];
+
+  // Re-resolve imports for all files (edges may shift if a changed file's exports changed)
+  for (const file of allFiles) {
+    resolveFileImports(file, rootPath);
+  }
+
+  // Rebuild edges and modules from the full file list
+  const edges = buildEdges(allFiles);
+  const modules = groupIntoModules(allFiles);
+
+  const graph: CodeGraph = {
+    root: rootPath,
+    files: allFiles,
+    edges,
+    modules,
+    fileHashes: newHashes,
+    commitHash: getCommitHash(rootPath),
+    generatedAt: new Date().toISOString(),
+  };
+
+  const stats = {
+    added: diff.added.length,
+    changed: diff.changed.length,
+    removed: diff.removed.length,
+    unchanged: unchangedFiles.length,
+  };
+
+  return { graph, stats };
 }
